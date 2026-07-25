@@ -1,0 +1,19 @@
+[worldserver]
+
+# Enable the autofishing feature globally.
+# Default: 1
+# After adding mod-autofishing to your AzerothCore modules folder, rebuild
+# worldserver so the module is included in the binary.
+AutoFishing.Enabled = 1
+
+# Allowed character GUIDs. Leave empty to allow all players if globally enabled.
+# Example: 4511,4722
+# Use .pinfo in-game to find a character GUID, then add it here.
+AutoFishing.AllowedGUIDs =
+
+# Base delay after a successful loot before the next cast, in milliseconds.
+AutoFishing.DelayMsMin = 700
+AutoFishing.DelayMsMax = 1600
+
+# Optional debug logging.
+AutoFishing.Debug = 1
