@@ -1,6 +1,6 @@
 # mod-autofishing
 
-Minimal standalone autofishing module for Aether WoW servers running AzerothCore.
+Minimal standalone autofishing module for WoW servers running AzerothCore.
 
 This module does not require `mod-playerbots` to work. It only handles the
 controlled player character’s fishing loop.
