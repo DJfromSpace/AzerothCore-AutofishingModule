@@ -8,11 +8,15 @@
 #include "MotionMaster.h"
 #include "Spell.h"
 #include "LootMgr.h"
+#include "Opcodes.h"
+#include "WorldPacket.h"
+#include "WorldSession.h"
 
 #include <algorithm>
 #include <unordered_map>
 #include <vector>
 #include <sstream>
+#include <string>
 
 namespace
 {
@@ -27,6 +31,8 @@ struct AutoFishState
     bool lootOpened = false;
     uint32 nextActionMs = 0;
     uint32 lastSeenBobberMs = 0;
+    uint32 readyBobberMs = 0;
+    uint32 lootRetryMs = 0;
     uint32 stuckLogMs = 0;
 };
 
@@ -132,31 +138,72 @@ bool AutoLootFishingBobber(Player* player, GameObject* bobber)
     if (!player || !bobber)
         return false;
 
-    player->SendLoot(bobber->GetGUID(), LOOT_FISHING);
+    bobber->Use(player);
+    LogState(player, "activated fishing bobber for skill update");
+    return true;
+}
 
-    Loot* loot = &bobber->loot;
-    bool lootedAny = false;
-    uint32 const maxLootSlot = loot->GetMaxSlotInLootFor(player);
+bool AutoStoreFishingLoot(Player* player)
+{
+    if (!player || !player->GetSession())
+        return false;
 
-    LogState(player, "opened fishing loot");
+    ObjectGuid lootGuid = player->GetLootGUID();
+    if (!lootGuid.IsGameObject())
+        return false;
 
+    Loot* loot = nullptr;
+    if (GameObject* lootGo = player->GetMap()->GetGameObject(lootGuid))
+        loot = &lootGo->loot;
+
+    if (!loot)
+        return false;
+
+    uint32 maxLootSlot = loot->GetMaxSlotInLootFor(player);
+    if (maxLootSlot == 0)
+        maxLootSlot = static_cast<uint32>(loot->items.size() + loot->quest_items.size());
+
+    LogState(player, "attempting auto-loot from fishing window");
+    LogState(player, (std::string("loot slot count = ") + std::to_string(maxLootSlot)).c_str());
+
+    std::vector<uint8> lootSlots;
     for (uint32 slot = 0; slot < maxLootSlot; ++slot)
     {
-        InventoryResult msg = EQUIP_ERR_OK;
-        if (LootItem* lootItem = player->StoreLootItem(static_cast<uint8>(slot), loot, msg))
-        {
-            lootedAny = true;
-            LogState(player, "stored loot item from fishing bobber");
-        }
-
-        if (msg == EQUIP_ERR_ITEM_NOT_FOUND || msg == EQUIP_ERR_ALREADY_LOOTED)
+        LootItem* lootItem = loot->LootItemInSlot(slot, player);
+        if (!lootItem || lootItem->is_looted)
             continue;
 
-        if (loot->isLooted())
-            break;
+        ItemPosCountVec destination;
+        InventoryResult msg = player->CanStoreNewItem(NULL_BAG, NULL_SLOT, destination, lootItem->itemid, lootItem->count);
+        if (msg != EQUIP_ERR_OK)
+        {
+            LogState(player, (std::string("cannot auto-loot slot; inventory result = ") +
+                std::to_string(static_cast<uint32>(msg))).c_str());
+            return false;
+        }
+
+        lootSlots.push_back(static_cast<uint8>(slot));
     }
 
-    return lootedAny;
+    if (lootSlots.empty())
+    {
+        LogState(player, "loot window has no eligible item slots yet");
+        return false;
+    }
+
+    for (uint8 lootSlot : lootSlots)
+    {
+        WorldPacket* lootPacket = new WorldPacket(CMSG_AUTOSTORE_LOOT_ITEM, 1);
+        *lootPacket << lootSlot;
+        player->GetSession()->QueuePacket(lootPacket);
+        LogState(player, (std::string("queued normal autoloot for slot ") + std::to_string(lootSlot)).c_str());
+    }
+
+    WorldPacket* releasePacket = new WorldPacket(CMSG_LOOT_RELEASE, 8);
+    *releasePacket << lootGuid;
+    player->GetSession()->QueuePacket(releasePacket);
+    LogState(player, "queued fishing loot-window release");
+    return true;
 }
 
 void StopAutoFishing(Player* player, char const* reason)
@@ -169,6 +216,8 @@ void StopAutoFishing(Player* player, char const* reason)
     state.lootOpened = false;
     state.nextActionMs = 0;
     state.lastSeenBobberMs = 0;
+    state.readyBobberMs = 0;
+    state.lootRetryMs = 0;
     state.stuckLogMs = 0;
     LogState(player, reason);
 }
@@ -259,29 +308,67 @@ public:
                 return;
             }
 
+            // GameObject::Use opens fishing loot synchronously, but the bobber remains
+            // present until the normal loot-release opcode is processed. Handle the
+            // pending loot before looking at the bobber again, or this state gets
+            // mistaken for an ended cast and auto-loot never runs.
+            if (state.lootOpened)
+            {
+                if (player->GetLootGUID().IsGameObject() && AutoStoreFishingLoot(player))
+                {
+                    state.lootOpened = false;
+                    state.lootRetryMs = 0;
+                    state.nextActionMs = RollDelay();
+                    state.lastSeenBobberMs = 0;
+                    state.readyBobberMs = 0;
+                    LogState(player, "queued fishing catch for automatic looting");
+                    return;
+                }
+
+                state.lootRetryMs += 250;
+                if (state.lootRetryMs < 3000)
+                {
+                    state.nextActionMs = 250;
+                    LogState(player, "loot window is not ready; retrying auto-loot");
+                    return;
+                }
+
+                StopAutoFishing(player, "stopping because fishing loot could not be auto-stored");
+                return;
+            }
+
             if (GameObject* bobber = FindOwnFishingBobber(player))
             {
                 if (bobber->getLootState() == GO_READY)
                 {
+                    if (state.readyBobberMs < 1200)
+                    {
+                        state.readyBobberMs += diff;
+                        state.nextActionMs = 150;
+                        LogState(player, "bobber ready; waiting briefly before looting");
+                        return;
+                    }
+
                     if (AutoLootFishingBobber(player, bobber))
                         LogState(player, "looted fishing bobber");
                     else
                         LogState(player, "fishing bobber ready but nothing was looted");
                     state.armed = true;
                     state.lootOpened = true;
-                    state.nextActionMs = RollDelay();
+                    state.nextActionMs = 250;
                     state.lastSeenBobberMs = 0;
+                    state.readyBobberMs = 0;
+                    state.lootRetryMs = 0;
                     return;
                 }
 
                 if (!IsFishing(player))
                 {
-                    LogState(player, "bobber is stale after fishing ended; forcing recast");
+                    LogState(player, "bobber exists after fishing ended; waiting for it to despawn");
                     state.lastSeenBobberMs = 0;
-                    player->CastSpell(player, FISHING_SPELL_ID, false);
-                    state.armed = true;
+                    state.readyBobberMs = 0;
                     state.lootOpened = false;
-                    state.nextActionMs = 1200;
+                    state.nextActionMs = 300;
                     return;
                 }
 
@@ -295,6 +382,7 @@ public:
                     LogState(player, "bobber existed too long without becoming ready; resetting cast state");
                     state.nextActionMs = 0;
                     state.lastSeenBobberMs = 0;
+                    state.readyBobberMs = 0;
                 }
 
                 return;
@@ -310,11 +398,9 @@ public:
                 return;
             }
 
-            if (state.lootOpened && player->GetLootGUID().IsGameObject())
+            if (FindOwnFishingBobber(player))
             {
-                state.lootOpened = false;
-                state.nextActionMs = 250;
-                LogState(player, "waiting briefly after opening loot");
+                state.nextActionMs = 300;
                 return;
             }
 
@@ -323,6 +409,7 @@ public:
                 player->CastSpell(player, FISHING_SPELL_ID, false);
                 state.armed = true;
                 state.lootOpened = false;
+                state.readyBobberMs = 0;
                 state.nextActionMs = 1200;
                 LogState(player, "cast fishing");
                 return;
@@ -392,7 +479,7 @@ public:
     void OnAfterConfigLoad(bool /*reload*/) override
     {
         g_AutoFishEnabled = sConfigMgr->GetOption<bool>("AutoFishing.Enabled", false);
-    g_AutoFishDebug = sConfigMgr->GetOption<bool>("AutoFishing.Debug", true);
+        g_AutoFishDebug = sConfigMgr->GetOption<bool>("AutoFishing.Debug", true);
         g_AutoFishDelayMin = sConfigMgr->GetOption<uint32>("AutoFishing.DelayMsMin", 700);
         g_AutoFishDelayMax = sConfigMgr->GetOption<uint32>("AutoFishing.DelayMsMax", 1600);
 
