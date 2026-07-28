@@ -31,7 +31,6 @@ struct AutoFishState
     bool lootOpened = false;
     uint32 nextActionMs = 0;
     uint32 lastSeenBobberMs = 0;
-    uint32 readyBobberMs = 0;
     uint32 lootRetryMs = 0;
     uint32 stuckLogMs = 0;
 };
@@ -114,12 +113,20 @@ bool HasFishingPole(Player* player)
     return false;
 }
 
-bool IsFishingBobberReady(Player* player)
+GameObject* FindChannelFishingBobber(Player* player)
 {
-    if (GameObject* go = player ? player->GetGameObject(FISHING_SPELL_ID) : nullptr)
-        return go->GetEntry() == FISHING_BOBBER_ENTRY && go->getLootState() == GO_READY;
+    if (!player || !player->GetMap())
+        return nullptr;
 
-    return false;
+    ObjectGuid channelGuid = player->GetGuidValue(UNIT_FIELD_CHANNEL_OBJECT);
+    if (!channelGuid.IsGameObject())
+        return nullptr;
+
+    GameObject* bobber = player->GetMap()->GetGameObject(channelGuid);
+    if (!bobber || bobber->GetEntry() != FISHING_BOBBER_ENTRY || bobber->GetOwnerGUID() != player->GetGUID())
+        return nullptr;
+
+    return bobber;
 }
 
 bool IsFishing(Player* player)
@@ -128,7 +135,10 @@ bool IsFishing(Player* player)
         return false;
 
     Spell* spell = player->GetCurrentSpell(CURRENT_CHANNELED_SPELL);
-    return spell != nullptr && spell->GetSpellInfo() != nullptr && spell->GetSpellInfo()->Id == FISHING_SPELL_ID;
+    if (spell && spell->GetSpellInfo() && spell->GetSpellInfo()->Id == FISHING_SPELL_ID)
+        return true;
+
+    return player->GetUInt32Value(UNIT_CHANNEL_SPELL) != 0 && FindChannelFishingBobber(player) != nullptr;
 }
 
 void LogState(Player* player, char const* msg);
@@ -216,7 +226,6 @@ void StopAutoFishing(Player* player, char const* reason)
     state.lootOpened = false;
     state.nextActionMs = 0;
     state.lastSeenBobberMs = 0;
-    state.readyBobberMs = 0;
     state.lootRetryMs = 0;
     state.stuckLogMs = 0;
     LogState(player, reason);
@@ -224,8 +233,11 @@ void StopAutoFishing(Player* player, char const* reason)
 
 GameObject* FindOwnFishingBobber(Player* player)
 {
+    if (GameObject* bobber = FindChannelFishingBobber(player))
+        return bobber;
+
     GameObject* go = player ? player->GetGameObject(FISHING_SPELL_ID) : nullptr;
-    if (go && go->GetEntry() == FISHING_BOBBER_ENTRY)
+    if (go && go->GetEntry() == FISHING_BOBBER_ENTRY && go->GetOwnerGUID() == player->GetGUID())
         return go;
     return nullptr;
 }
@@ -281,21 +293,27 @@ public:
         {
             if (player->isDead() || player->IsInCombat() || player->isMoving() || player->IsBeingTeleported() || !player->IsAlive())
             {
-                StopAutoFishing(player, "cancelling current fishing cycle because movement/combat/death/teleport");
+                if (state.armed || state.lootOpened)
+                    StopAutoFishing(player, "cancelling current fishing cycle because movement/combat/death/teleport");
                 return;
+            }
+
+            GameObject* bobber = FindOwnFishingBobber(player);
+            bool fishing = IsFishing(player);
+
+            if (!state.armed)
+            {
+                if (!fishing && !bobber)
+                    return;
+
+                state.armed = true;
+                state.lastSeenBobberMs = 0;
+                LogState(player, bobber ? "armed by manual fishing cast and acquired bobber" : "armed by manual fishing cast");
             }
 
             if (!HasFishingPole(player))
             {
-                if (state.stuckLogMs == 0 || state.stuckLogMs > 5000)
-                {
-                    LogState(player, "stopping because no fishing pole is equipped or carried");
-                    state.stuckLogMs = 1;
-                }
-                else
-                {
-                    state.stuckLogMs += diff;
-                }
+                StopAutoFishing(player, "stopping because no fishing pole is equipped or carried");
                 return;
             }
 
@@ -304,7 +322,6 @@ public:
             if (state.nextActionMs > diff)
             {
                 state.nextActionMs -= diff;
-                LogState(player, "waiting for next action window");
                 return;
             }
 
@@ -320,7 +337,6 @@ public:
                     state.lootRetryMs = 0;
                     state.nextActionMs = RollDelay();
                     state.lastSeenBobberMs = 0;
-                    state.readyBobberMs = 0;
                     LogState(player, "queued fishing catch for automatic looting");
                     return;
                 }
@@ -337,18 +353,19 @@ public:
                 return;
             }
 
-            if (GameObject* bobber = FindOwnFishingBobber(player))
+            bobber = FindOwnFishingBobber(player);
+            fishing = IsFishing(player);
+
+            if (bobber)
             {
+                if (state.lastSeenBobberMs == 0)
+                {
+                    LogState(player, (std::string("tracking fishing bobber; loot state = ") +
+                        std::to_string(static_cast<uint32>(bobber->getLootState()))).c_str());
+                }
+
                 if (bobber->getLootState() == GO_READY)
                 {
-                    if (state.readyBobberMs < 1200)
-                    {
-                        state.readyBobberMs += diff;
-                        state.nextActionMs = 150;
-                        LogState(player, "bobber ready; waiting briefly before looting");
-                        return;
-                    }
-
                     if (AutoLootFishingBobber(player, bobber))
                         LogState(player, "looted fishing bobber");
                     else
@@ -357,16 +374,14 @@ public:
                     state.lootOpened = true;
                     state.nextActionMs = 250;
                     state.lastSeenBobberMs = 0;
-                    state.readyBobberMs = 0;
                     state.lootRetryMs = 0;
                     return;
                 }
 
-                if (!IsFishing(player))
+                if (!fishing)
                 {
                     LogState(player, "bobber exists after fishing ended; waiting for it to despawn");
                     state.lastSeenBobberMs = 0;
-                    state.readyBobberMs = 0;
                     state.lootOpened = false;
                     state.nextActionMs = 300;
                     return;
@@ -382,19 +397,8 @@ public:
                     LogState(player, "bobber existed too long without becoming ready; resetting cast state");
                     state.nextActionMs = 0;
                     state.lastSeenBobberMs = 0;
-                    state.readyBobberMs = 0;
                 }
 
-                return;
-            }
-
-            if (!state.armed)
-            {
-                if (IsFishing(player))
-                {
-                    state.armed = true;
-                    LogState(player, "armed by manual fishing cast");
-                }
                 return;
             }
 
@@ -404,12 +408,11 @@ public:
                 return;
             }
 
-            if (!IsFishing(player))
+            if (!fishing)
             {
                 player->CastSpell(player, FISHING_SPELL_ID, false);
                 state.armed = true;
                 state.lootOpened = false;
-                state.readyBobberMs = 0;
                 state.nextActionMs = 1200;
                 LogState(player, "cast fishing");
                 return;
